@@ -1,0 +1,467 @@
+- name: Update package metadata (Debian)
+  ansible.builtin.apt:
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: Update package metadata (RedHat)
+  ansible.builtin.dnf:
+    update_cache: yes
+  when: ansible_os_family == "RedHat"
+
+- name: Install OpenJDK 17 (Debian)
+  ansible.builtin.apt:
+    name: openjdk-17-jdk
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Install OpenJDK 17 (RedHat)
+  ansible.builtin.dnf:
+    name: java-17-openjdk
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Install dependencies unzip, wget (Debian)
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - unzip
+    - wget
+  when: ansible_os_family == "Debian"
+
+- name: Install dependencies unzip, wget (RedHat)
+  ansible.builtin.dnf:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - unzip
+    - wget
+  when: ansible_os_family == "RedHat"
+
+- name: Ensure firewalld is installed (RedHat)
+  ansible.builtin.dnf:
+    name: firewalld
+    state: present
+  when: ansible_os_family == "RedHat" and firewalld_enabled
+
+- name: Ensure firewalld is running and enabled (RedHat)
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: yes
+  when: ansible_os_family == "RedHat" and firewalld_enabled
+
+- name: Reload firewalld to apply changes (RedHat)
+  ansible.builtin.service:
+    name: firewalld
+    state: reloaded
+  when: ansible_os_family == "RedHat" and firewalld_enabled
+# 1. Mettre à jour les paquets apt
+- name: Update APT package index
+  apt:
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+# 2. Create user and group for Keycloak
+- name: Create group for Keycloak
+  group:
+    name: keycloak
+    state: present
+
+- name: Create user for Keycloak
+  user:
+    name: keycloak
+    state: present
+    group: keycloak
+    createhome: no
+    system: yes
+    shell: /sbin/nologin
+# 2. Installer OpenJDK 17
+
+- name: Gather installed packages
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Fail if required packages missing (Debian)
+  ansible.builtin.assert:
+    that:
+      - "'openjdk-17-jdk' in ansible_facts.packages"
+      - "'unzip' in ansible_facts.packages"
+      - "'wget' in ansible_facts.packages"
+    fail_msg: "Missing packages: {{ ['openjdk-17-jdk','unzip','wget'] | reject('in', ansible_facts.packages.keys() | list) | list }}"
+  when: ansible_os_family == "Debian"
+
+- name: Fail if required packages missing (RedHat)
+  ansible.builtin.assert:
+    that:
+      - "'java-17-openjdk' in ansible_facts.packages"
+      - "'unzip' in ansible_facts.packages"
+      - "'wget' in ansible_facts.packages"
+    fail_msg: "Missing packages: {{ ['java-17-openjdk','unzip','wget'] | reject('in', ansible_facts.packages.keys() | list) | list }}"
+  when: ansible_os_family == "RedHat"
+
+
+- name: create /opt/keycloak directory
+  file:
+    dest: /opt/keycloak
+    state: directory
+    owner: keycloak
+    group: keycloak
+
+# 4. Télécharger Keycloak
+- name: Download Keycloak
+  get_url:
+    url: "https://github.com/keycloak/keycloak/releases/download/25.0.6/keycloak-25.0.6.zip"
+    dest: /opt/keycloak/keycloak.zip
+    mode: '0755'
+
+# 5. Extraire Keycloak
+- name: Extract Keycloak
+  unarchive:
+    src: /opt/keycloak/keycloak.zip
+    dest: /opt/keycloak/
+    remote_src: yes
+
+# 6. Créer un lien symbolique pour simplifier les chemins
+- name: Create a symbolic link to Keycloak directory
+  file:
+    src: /opt/keycloak/keycloak-25.0.6
+    dest: /opt/keycloak/latest
+    state: link
+
+- name: create data directory
+  file:
+    dest: /opt/keycloak/keycloak-25.0.6/data
+    state: directory
+    owner: keycloak
+    group: keycloak
+
+# 7. Configurer les variables d'environnement
+- name: Set environment variables for Keycloak
+  lineinfile:
+    path: /etc/environment
+    line: "JAVA_HOME={{ jdk_home }}"
+    state: present
+
+- name: ownership on /opt/keycloak
+  file:
+    dest: /opt/keycloak/latest/lib
+    owner: keycloak
+    group: keycloak
+    recurse: yes
+
+- name: firewalld - Open port KeyCloak
+  ansible.builtin.firewalld:
+    port: 8443/tcp
+    permanent: yes
+    state: enabled
+
+- name: Reload firewalld to apply changes (Debian)
+  ansible.builtin.service:
+    name: firewalld
+    state: reloaded
+  when: ansible_os_family == "Debian" and firewalld_enabled
+
+- name: create ssl folder
+  file:
+    dest: "{{security_ssl_cert_folder}}"
+    state: directory
+    mode: '0755'
+
+- name: copy SSO ssl certificates
+  copy:
+    dest: "{{security_ssl_cert_folder}}/{{keycloak_sso_hostname}}.cert.pem"
+    src: "{{source_cert_folder}}/{{keycloak_sso_hostname}}.cert.pem"
+
+- name: copy SSO ssl certificates
+  copy:
+    dest: "{{security_ssl_cert_folder}}/{{keycloak_sso_hostname}}.key.pem"
+    src: "{{source_cert_folder}}/{{keycloak_sso_hostname}}.key.pem"
+
+- name: copy inventory ssl certificates
+  copy:
+    dest: "{{security_ssl_cert_folder}}/{{inventory_hostname}}.cert.pem"
+    src: "{{source_cert_folder}}/{{inventory_hostname}}.cert.pem"
+
+- name: copy SSO ssl certificates
+  copy:
+    dest: "{{security_ssl_cert_folder}}/{{inventory_hostname}}.key.pem"
+    src: "{{source_cert_folder}}/{{inventory_hostname}}.key.pem"
+
+- set_fact:
+    ssl_opts: "--https-port={{ keycloak_server_port }} --https-certificate-file={{security_ssl_cert_folder}}/{{keycloak_sso_hostname}}.cert.pem --https-certificate-key-file={{security_ssl_cert_folder}}/{{keycloak_sso_hostname}}.key.pem"
+    protocol: "https"
+  when: keycloak_ssl_enabled
+
+- set_fact:
+    proxy: "--proxy-headers forwarded"
+  when: keycloak_proxy_enabled
+
+- set_fact:
+    db_opts: "--db postgres --db-url-database {{ keycloak_database_name }} --db-url-host {{ keycloak_database_hostnames[0] }} --db-username {{keycloak_database_user}} --db-password {{keycloak_database_user_password}}"
+
+- name: create keycloak log dir
+  file:
+    dest: /var/log/keycloak
+    state: directory
+    owner: keycloak
+    group: keycloak
+
+- set_fact:
+    log_opts: "--log=file  --log-level=info --log-file=/var/log/keycloak/keycloak.log"
+# 8. Ajouter Keycloak comme service systemd
+- name: Create systemd service for Keycloak
+  copy:
+    dest: /usr/lib/systemd/system/keycloak.service
+    content: |
+      [Unit]
+      Description=Keycloak Service
+      After=syslog.target network.target
+
+      [Service]
+      User=keycloak
+      Group=keycloak
+      Environment=JAVA_HOME={{ jdk_home }}
+      Environment=KEYCLOAK_ADMIN={{ keycloak_admin_user }}
+      Environment=KEYCLOAK_ADMIN_PASSWORD={{ keycloak_admin_password }}
+      WorkingDirectory=/opt/keycloak/latest
+      ExecStart=/opt/keycloak/latest/bin/kc.sh start  --hostname={{protocol}}://{{keycloak_sso_hostname}}:{{keycloak_server_port}} {{ ssl_opts }} {{ proxy }} {{ db_opts }} {{ log_opts }}
+      Restart=always
+      RestartSec=10
+      SyslogIdentifier=keycloak
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Reload systemd
+
+
+# 9. Redémarrer le service systemd pour prendre en compte le nouveau service
+- name: Enable and start Keycloak service
+  systemd:
+    name: keycloak
+    enabled: yes
+    state: started
+
+- set_fact:
+    keycloak_base_url: "{{protocol}}://{{keycloak_sso_hostname}}:{{keycloak_server_port}}"
+    keycloak_validate_certs_resolved: "{{ keycloak_validate_certs | default(true) }}"
+    keycloak_target_roles: "{{ keycloak_admin_roles | default(['realm-admin']) }}"
+
+- name: Ensure service account variables are provided
+  ansible.builtin.assert:
+    that:
+      - keycloak_service_user is defined
+      - keycloak_service_user_password is defined
+    quiet: true
+
+- name: Wait for Keycloak API availability
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/realms/master"
+    method: GET
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_health
+  retries: 12
+  delay: 5
+  until: keycloak_health.status == 200
+
+- name: Obtain administrative access token
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: password
+      client_id: admin-cli
+      username: "{{ keycloak_admin_user }}"
+      password: "{{ keycloak_admin_password }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_token
+  retries: 5
+  delay: 5
+  until: keycloak_token.status == 200
+  no_log: true
+
+- set_fact:
+    keycloak_admin_token: "{{ keycloak_token.json.access_token }}"
+  no_log: true
+
+- set_fact:
+    keycloak_admin_headers:
+      Authorization: "Bearer {{ keycloak_admin_token }}"
+  no_log: true
+
+- name: Ensure production realm exists
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ {'id': keycloak_realm, 'realm': keycloak_realm, 'enabled': True} | to_json }}"
+    status_code: [201, 409]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_realm_create
+  changed_when: keycloak_realm_create.status == 201
+
+- name: Ensure service user exists
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ {'username': keycloak_service_user, 'enabled': True, 'emailVerified': True} | to_json }}"
+    status_code: [201, 409]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_service_user_create
+  changed_when: keycloak_service_user_create.status == 201
+  no_log: true
+
+- name: Look up service user identifier
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users?username={{ keycloak_service_user | urlencode }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_service_user_lookup
+  failed_when: (keycloak_service_user_lookup.json | length) == 0
+  no_log: true
+
+- set_fact:
+    keycloak_service_user_id: "{{ (keycloak_service_user_lookup.json | first).id }}"
+
+- name: Configure service user credentials
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users/{{ keycloak_service_user_id }}/reset-password"
+    method: PUT
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ {'type': 'password', 'value': keycloak_service_user_password, 'temporary': False} | to_json }}"
+    status_code: 204
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  no_log: true
+
+- name: Look up realm-management client
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=realm-management"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_realm_management_client_lookup
+  failed_when: (keycloak_realm_management_client_lookup.json | length) == 0
+
+- set_fact:
+    keycloak_realm_management_client_id: "{{ (keycloak_realm_management_client_lookup.json | first).id }}"
+
+- name: Ensure OIDC client variables are provided
+  ansible.builtin.assert:
+    that:
+      - keycloak_client_name is defined
+      - keycloak_client_password is defined
+    quiet: true
+
+- name: Ensure OIDC client exists
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ {
+        'clientId': keycloak_client_name,
+        'protocol': 'openid-connect',
+        'enabled': True,
+        'publicClient': False,
+        'standardFlowEnabled': True,
+        'serviceAccountsEnabled': False,
+        'redirectUris': keycloak_client_redirect_uris | default(['*']),
+        'webOrigins': keycloak_client_web_origins | default(['*'])
+      } | to_json }}"
+    status_code: [201, 409]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  no_log: true
+
+- name: Look up OIDC client identifier
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ keycloak_client_name | urlencode }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_client_lookup
+  failed_when: (keycloak_client_lookup.json | length) == 0
+  no_log: true
+
+- set_fact:
+    keycloak_client_id: "{{ (keycloak_client_lookup.json | first).id }}"
+  no_log: true
+
+- name: Read current OIDC client configuration
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_id }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_client_detail
+  no_log: true
+
+- set_fact:
+    keycloak_client_payload: "{{ keycloak_client_detail.json | combine({
+      'clientId': keycloak_client_name,
+      'protocol': 'openid-connect',
+      'enabled': True,
+      'publicClient': False,
+      'clientAuthenticatorType': 'client-secret',
+      'serviceAccountsEnabled': False,
+      'standardFlowEnabled': True,
+      'directAccessGrantsEnabled': False,
+      'redirectUris': keycloak_client_redirect_uris | default(keycloak_client_detail.json.redirectUris | default(['*'])),
+      'webOrigins': keycloak_client_web_origins | default(keycloak_client_detail.json.webOrigins | default(['*'])),
+      'secret': keycloak_client_password
+    }, recursive=True) }}"
+  no_log: true
+
+- name: Ensure OIDC client configuration
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_id }}"
+    method: PUT
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ keycloak_client_payload | to_json }}"
+    status_code: 204
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  no_log: true
+
+- name: Retrieve admin client role definitions
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_realm_management_client_id }}/roles/{{ item }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  loop: "{{ keycloak_target_roles }}"
+  register: keycloak_admin_role_defs
+
+- set_fact:
+    keycloak_admin_role_payload: "{{ keycloak_admin_role_defs.results | map(attribute='json') | list }}"
+  no_log: true
+
+- name: Read current client role assignments
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users/{{ keycloak_service_user_id }}/role-mappings/clients/{{ keycloak_realm_management_client_id }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_current_client_roles
+  no_log: true
+
+- set_fact:
+    keycloak_current_role_names: "{{ keycloak_current_client_roles.json | default([]) | map(attribute='name') | list }}"
+
+- set_fact:
+    keycloak_missing_role_names: "{{ keycloak_target_roles | difference(keycloak_current_role_names) }}"
+  no_log: true
+
+- set_fact:
+    keycloak_missing_role_payload: "{{ keycloak_admin_role_payload | selectattr('name', 'in', keycloak_missing_role_names) | list }}"
+  no_log: true
+
+- name: Grant admin roles to service user
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users/{{ keycloak_service_user_id }}/role-mappings/clients/{{ keycloak_realm_management_client_id }}"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ keycloak_missing_role_payload | to_json }}"
+    status_code: 204
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when: keycloak_missing_role_payload | length > 0
