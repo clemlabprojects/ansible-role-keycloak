@@ -406,7 +406,7 @@
       'clientAuthenticatorType': 'client-secret',
       'serviceAccountsEnabled': False,
       'standardFlowEnabled': True,
-      'directAccessGrantsEnabled': False,
+      'directAccessGrantsEnabled': True,
       'redirectUris': keycloak_client_redirect_uris | default(keycloak_client_detail.json.redirectUris | default(['*'])),
       'webOrigins': keycloak_client_web_origins | default(keycloak_client_detail.json.webOrigins | default(['*'])),
       'secret': keycloak_client_password
