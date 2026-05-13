@@ -465,3 +465,481 @@
     status_code: 204
     validate_certs: "{{ keycloak_validate_certs_resolved }}"
   when: keycloak_missing_role_payload | length > 0
+
+# ============================================================================
+# LDAP user federation (FreeIPA / RHDS / generic LDAP)
+#
+# Enables an LDAP-backed user federation provider on the realm so OIDC tokens
+# carry real LDAP usernames (Ambari/Polaris/etc. then resolve them as known
+# principals). Idempotent: looks up the component by name, POSTs if absent or
+# PUTs if present. Optional initial sync triggered when keycloak_ldap_sync_on_setup.
+#
+# Auto-enables when freeipa_servers is defined in the calling play; explicit
+# opt-out: set keycloak_ldap_enabled: false.
+# ============================================================================
+
+- name: Resolve LDAP federation defaults
+  ansible.builtin.set_fact:
+    keycloak_ldap_enabled_resolved: "{{ keycloak_ldap_enabled | default((freeipa_servers is defined) and ((freeipa_servers | length) > 0)) | bool }}"
+    keycloak_ldap_federation_name: "{{ keycloak_ldap_federation_name | default('freeipa') }}"
+    keycloak_ldap_vendor: "{{ keycloak_ldap_vendor | default('other') }}"
+    keycloak_ldap_url_resolved: >-
+      {{ keycloak_ldap_url
+         | default('ldap://' ~ (freeipa_servers | first) if (freeipa_servers is defined and (freeipa_servers | length) > 0) else '') }}
+    keycloak_ldap_users_dn_resolved: "{{ keycloak_ldap_users_dn | default(ipaserver_domain_suffix_users | default('')) }}"
+    keycloak_ldap_bind_dn_resolved: >-
+      {{ keycloak_ldap_bind_dn
+         | default('uid=hadoopadmin,' ~ ipaserver_domain_suffix_users if (ipaserver_domain_suffix_users is defined) else '') }}
+    keycloak_ldap_bind_credential_resolved: "{{ keycloak_ldap_bind_credential | default(ambari_admin_principal_password | default('')) }}"
+    keycloak_ldap_username_attr: "{{ keycloak_ldap_username_attr | default('uid') }}"
+    keycloak_ldap_rdn_attr: "{{ keycloak_ldap_rdn_attr | default('uid') }}"
+    keycloak_ldap_uuid_attr: "{{ keycloak_ldap_uuid_attr | default('ipaUniqueID') }}"
+    keycloak_ldap_user_object_classes: "{{ keycloak_ldap_user_object_classes | default('inetOrgPerson, organizationalPerson') }}"
+    keycloak_ldap_edit_mode: "{{ keycloak_ldap_edit_mode | default('READ_ONLY') }}"
+    keycloak_ldap_search_scope: "{{ keycloak_ldap_search_scope | default('1') }}"
+    keycloak_ldap_sync_on_setup: "{{ keycloak_ldap_sync_on_setup | default(true) | bool }}"
+    # --- LDAP group-mapper (Path A) — sub-component of the federation that imports FreeIPA
+    # groups + user memberships into Keycloak. Defaults to ON whenever the parent LDAP
+    # federation is on; opt out per-deploy with keycloak_ldap_group_mapper_enabled: false.
+    keycloak_ldap_group_mapper_enabled_resolved: >-
+      {{ keycloak_ldap_group_mapper_enabled
+         | default(keycloak_ldap_enabled | default((freeipa_servers is defined) and ((freeipa_servers | length) > 0)))
+         | bool }}
+    keycloak_ldap_group_mapper_name: "{{ keycloak_ldap_group_mapper_name | default('group-ldap-mapper') }}"
+    keycloak_ldap_groups_dn_resolved: "{{ keycloak_ldap_groups_dn | default(ipaserver_domain_suffix_groups | default('')) }}"
+    keycloak_ldap_group_name_attr: "{{ keycloak_ldap_group_name_attr | default('cn') }}"
+    keycloak_ldap_group_object_classes: "{{ keycloak_ldap_group_object_classes | default('groupOfNames') }}"
+    keycloak_ldap_membership_attr: "{{ keycloak_ldap_membership_attr | default('member') }}"
+    keycloak_ldap_membership_type: "{{ keycloak_ldap_membership_type | default('DN') }}"
+    keycloak_ldap_group_mapper_mode: "{{ keycloak_ldap_group_mapper_mode | default('READ_ONLY') }}"
+
+- name: Validate LDAP federation inputs
+  ansible.builtin.assert:
+    that:
+      - keycloak_ldap_url_resolved | length > 0
+      - keycloak_ldap_users_dn_resolved | length > 0
+      - keycloak_ldap_bind_dn_resolved | length > 0
+      - keycloak_ldap_bind_credential_resolved | length > 0
+    fail_msg: "LDAP federation enabled but URL/usersDn/bindDn/bindCredential not resolved (set keycloak_ldap_url, keycloak_ldap_users_dn, keycloak_ldap_bind_dn, keycloak_ldap_bind_credential, or define freeipa_servers + ipaserver_domain_suffix_users + ambari_admin_principal_password)"
+  when: keycloak_ldap_enabled_resolved
+
+- name: Look up realm UUID for federation parentId
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_realm_detail
+  when: keycloak_ldap_enabled_resolved
+
+- name: Look up existing LDAP federation component by name
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.UserStorageProvider&parent={{ keycloak_realm_detail.json.id }}&name={{ keycloak_ldap_federation_name | urlencode }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ldap_lookup
+  when: keycloak_ldap_enabled_resolved
+
+- name: Build LDAP federation component body
+  ansible.builtin.set_fact:
+    keycloak_ldap_component_body:
+      name: "{{ keycloak_ldap_federation_name }}"
+      providerId: ldap
+      providerType: org.keycloak.storage.UserStorageProvider
+      parentId: "{{ keycloak_realm_detail.json.id }}"
+      config:
+        enabled: ["true"]
+        priority: ["0"]
+        vendor: ["{{ keycloak_ldap_vendor }}"]
+        connectionUrl: ["{{ keycloak_ldap_url_resolved }}"]
+        usersDn: ["{{ keycloak_ldap_users_dn_resolved }}"]
+        bindDn: ["{{ keycloak_ldap_bind_dn_resolved }}"]
+        bindCredential: ["{{ keycloak_ldap_bind_credential_resolved }}"]
+        authType: ["simple"]
+        usernameLDAPAttribute: ["{{ keycloak_ldap_username_attr }}"]
+        rdnLDAPAttribute: ["{{ keycloak_ldap_rdn_attr }}"]
+        uuidLDAPAttribute: ["{{ keycloak_ldap_uuid_attr }}"]
+        userObjectClasses: ["{{ keycloak_ldap_user_object_classes }}"]
+        editMode: ["{{ keycloak_ldap_edit_mode }}"]
+        searchScope: ["{{ keycloak_ldap_search_scope }}"]
+        importEnabled: ["true"]
+        syncRegistrations: ["false"]
+        useTruststoreSpi: ["ldapsOnly"]
+        connectionPooling: ["true"]
+        pagination: ["true"]
+        allowKerberosAuthentication: ["false"]
+        batchSizeForSync: ["1000"]
+        fullSyncPeriod: ["-1"]
+        changedSyncPeriod: ["-1"]
+        cachePolicy: ["DEFAULT"]
+        trustEmail: ["false"]
+  when: keycloak_ldap_enabled_resolved
+  no_log: true
+
+- name: Create LDAP federation component (when missing)
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ keycloak_ldap_component_body | to_json }}"
+    status_code: [201]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ldap_create
+  when:
+    - keycloak_ldap_enabled_resolved
+    - (keycloak_ldap_lookup.json | length) == 0
+  no_log: true
+
+- name: Update LDAP federation component (when present)
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components/{{ (keycloak_ldap_lookup.json | first).id }}"
+    method: PUT
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ keycloak_ldap_component_body | combine({'id': (keycloak_ldap_lookup.json | first).id}) | to_json }}"
+    status_code: [204]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when:
+    - keycloak_ldap_enabled_resolved
+    - (keycloak_ldap_lookup.json | length) > 0
+  no_log: true
+
+- name: Re-fetch LDAP federation component id (after create or update)
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.UserStorageProvider&parent={{ keycloak_realm_detail.json.id }}&name={{ keycloak_ldap_federation_name | urlencode }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ldap_postlookup
+  when: keycloak_ldap_enabled_resolved
+
+- name: Trigger initial LDAP sync
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/user-storage/{{ (keycloak_ldap_postlookup.json | first).id }}/sync?action=triggerFullSync"
+    method: POST
+    headers: "{{ keycloak_admin_headers }}"
+    status_code: [200]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ldap_sync
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_sync_on_setup
+    - (keycloak_ldap_postlookup.json | length) > 0
+
+- name: Show LDAP sync result
+  ansible.builtin.debug:
+    msg: "LDAP federation '{{ keycloak_ldap_federation_name }}' sync: {{ keycloak_ldap_sync.json | default('(skipped)') }}"
+  when: keycloak_ldap_enabled_resolved
+
+# ============================================================================
+# Path A — LDAP group-mapper (group-ldap-mapper sub-component)
+#
+# By default Keycloak's LDAP federation imports users only; group memberships
+# stay in FreeIPA.  This sub-component imports both: each FreeIPA group becomes
+# a Keycloak group of the same name, and member DNs are resolved into Keycloak
+# user memberships.  Memberships then propagate into the JWT 'groups' claim
+# (assuming the OIDC client has a Group Membership protocol mapper).
+#
+# Idempotent: looked up by name on the federation's parentId; POST if absent,
+# PUT if present.  The configured `groups.dn` defaults to
+# ipaserver_domain_suffix_groups (the FreeIPA groups subtree).
+#
+# Skipped when keycloak_ldap_group_mapper_enabled=false.  Auto-disabled when
+# the parent LDAP federation is also disabled.
+# ============================================================================
+
+- name: Validate LDAP group-mapper inputs
+  ansible.builtin.assert:
+    that:
+      - keycloak_ldap_groups_dn_resolved | length > 0
+    fail_msg: "LDAP group-mapper enabled but groups DN not resolved (set keycloak_ldap_groups_dn or define ipaserver_domain_suffix_groups)"
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+
+- name: Look up existing LDAP group-ldap-mapper sub-component
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper&parent={{ (keycloak_ldap_postlookup.json | first).id }}&name={{ keycloak_ldap_group_mapper_name | urlencode }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ldap_group_mapper_lookup
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+    - (keycloak_ldap_postlookup.json | length) > 0
+
+- name: Build LDAP group-mapper component body
+  ansible.builtin.set_fact:
+    keycloak_ldap_group_mapper_body:
+      name: "{{ keycloak_ldap_group_mapper_name }}"
+      providerId: group-ldap-mapper
+      providerType: org.keycloak.storage.ldap.mappers.LDAPStorageMapper
+      parentId: "{{ (keycloak_ldap_postlookup.json | first).id }}"
+      config:
+        # LDAP subtree containing the group entries.
+        groups.dn: ["{{ keycloak_ldap_groups_dn_resolved }}"]
+        # FreeIPA stores group names in `cn`; objectclass is `groupOfNames` (member=DN).
+        group.name.ldap.attribute: ["{{ keycloak_ldap_group_name_attr }}"]
+        group.object.classes: ["{{ keycloak_ldap_group_object_classes }}"]
+        # Member attribute on the group object pointing at user DNs.
+        membership.ldap.attribute: ["{{ keycloak_ldap_membership_attr }}"]
+        membership.attribute.type: ["{{ keycloak_ldap_membership_type }}"]
+        # Which LDAP user attribute is the member-DN's "leaf" attribute (uid for FreeIPA).
+        membership.user.ldap.attribute: ["{{ keycloak_ldap_username_attr }}"]
+        # Resolve a user's groups by querying group entries' member attribute (vs. memberOf
+        # on the user — FreeIPA supports both but member-on-group is universal).
+        user.roles.retrieve.strategy: ["LOAD_GROUPS_BY_MEMBER_ATTRIBUTE"]
+        # Where in Keycloak's group tree the imported groups land; "/" = top level.
+        groups.path: ["/"]
+        # READ_ONLY: don't let Keycloak push group changes back to FreeIPA.
+        mode: ["{{ keycloak_ldap_group_mapper_mode }}"]
+        # Match group names case-sensitively; FreeIPA group names are lowercase by convention.
+        preserve.group.inheritance: ["false"]
+        ignore.missing.groups: ["false"]
+        memberof.ldap.attribute: ["memberOf"]
+        drop.non.existing.groups.during.sync: ["false"]
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+
+- name: Create LDAP group-mapper sub-component (when missing)
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ keycloak_ldap_group_mapper_body | to_json }}"
+    status_code: [201]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+    - (keycloak_ldap_group_mapper_lookup.json | default([]) | length) == 0
+
+- name: Update LDAP group-mapper sub-component (when present)
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components/{{ (keycloak_ldap_group_mapper_lookup.json | first).id }}"
+    method: PUT
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ keycloak_ldap_group_mapper_body | combine({'id': (keycloak_ldap_group_mapper_lookup.json | first).id}) | to_json }}"
+    status_code: [204]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+    - (keycloak_ldap_group_mapper_lookup.json | default([]) | length) > 0
+
+- name: Trigger LDAP sync after group-mapper setup (so groups + memberships flow in immediately)
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/user-storage/{{ (keycloak_ldap_postlookup.json | first).id }}/sync?action=triggerFullSync"
+    method: POST
+    headers: "{{ keycloak_admin_headers }}"
+    status_code: [200]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ldap_group_sync
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+    - keycloak_ldap_sync_on_setup
+    - (keycloak_ldap_postlookup.json | length) > 0
+
+- name: Show LDAP group-mapper sync result
+  ansible.builtin.debug:
+    msg: "LDAP group-mapper '{{ keycloak_ldap_group_mapper_name }}' sync: {{ keycloak_ldap_group_sync.json | default('(skipped)') }}"
+  when:
+    - keycloak_ldap_enabled_resolved
+    - keycloak_ldap_group_mapper_enabled_resolved
+
+# ------------------------------------------------------------------------------------------
+# Path B fallback — Keycloak realm groups + user-to-group memberships from cluster_users.
+#
+# Only fires when LDAP federation is DISABLED (or absent).  When FreeIPA federation is on,
+# the group-ldap-mapper (Path A, above) already imports both groups and memberships from
+# FreeIPA, making this block redundant.
+#
+# When LDAP is off (e.g. Keycloak-only deployment without FreeIPA), this block:
+#   1. Creates each cluster_user in Keycloak (since federation didn't import them)
+#   2. Creates each cluster_groups + cluster_users[*].groups entry as a Keycloak group
+#   3. Assigns the user-to-group memberships
+#
+# Source of truth is cluster_users[*].groups + cluster_groups.  Usernames are computed with
+# the same convention the ansible-role-freeipa role uses (compute_name action plugin) so
+# downstream consumers (Ambari, etc.) see the same uid regardless of which path produced it.
+# ------------------------------------------------------------------------------------------
+- name: "[KC-GROUPS] Resolve whether Path B should run (skipped when LDAP federation is active)"
+  ansible.builtin.set_fact:
+    # Mirrors the role's keycloak_ldap_enabled_resolved logic so Path B is exactly the
+    # complement of Path A — never both, never neither (when cluster_users is defined).
+    kc_path_b_active: >-
+      {{ not (keycloak_ldap_enabled
+              | default((freeipa_servers is defined) and ((freeipa_servers | length) > 0))
+              | bool) }}
+
+- name: "[KC-GROUPS] Path B — create cluster_users + groups + memberships in Keycloak (LDAP off)"
+  when:
+    - kc_path_b_active | bool
+    - cluster_users is defined
+    - (cluster_users | length) > 0
+  block:
+    - name: "[KC-GROUPS] Acquire Keycloak admin token (post-install)"
+      uri:
+        url: "https://{{ keycloak_sso_hostname }}:{{ keycloak_server_port }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: "{{ keycloak_admin_user }}"
+          password: "{{ keycloak_admin_password }}"
+        validate_certs: false
+      register: kc_post_admin_token
+      no_log: true
+      become: false
+
+    - name: "[KC-GROUPS] Compute the unique set of group names from cluster_users + cluster_groups"
+      set_fact:
+        kc_realm_groups: "{{ ((cluster_groups | default([])) + (cluster_users | map(attribute='groups') | flatten | list)) | unique | reject('equalto', '') | list }}"
+
+    - name: "[KC-GROUPS] Ensure each cluster group exists in the Keycloak realm"
+      uri:
+        url: "https://{{ keycloak_sso_hostname }}:{{ keycloak_server_port }}/admin/realms/{{ keycloak_realm }}/groups"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_post_admin_token.json.access_token }}"
+          Content-Type: application/json
+        body: "{{ {'name': item} | to_json }}"
+        status_code: [201, 409]    # 409 = already exists, idempotent
+        validate_certs: false
+      loop: "{{ kc_realm_groups }}"
+      become: false
+
+    - name: "[KC-GROUPS] Resolve each Keycloak group's UUID"
+      uri:
+        url: "https://{{ keycloak_sso_hostname }}:{{ keycloak_server_port }}/admin/realms/{{ keycloak_realm }}/groups?search={{ item | urlencode }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_post_admin_token.json.access_token }}"
+        validate_certs: false
+        return_content: true
+      register: kc_group_lookups
+      loop: "{{ kc_realm_groups }}"
+      become: false
+
+    - name: "[KC-GROUPS] Build group-name → UUID map"
+      set_fact:
+        kc_group_ids: "{{ kc_group_ids | default({}) | combine({(item.item): ((item.json | first).id)}) }}"
+      loop: "{{ kc_group_lookups.results }}"
+      when: (item.json | length) > 0
+      no_log: true
+
+    - name: "[KC-GROUPS] Compute FreeIPA username for each cluster_user (mirrors compute_name action plugin)"
+      compute_name:
+        givenname: "{{ item.givenname }}"
+        sn: "{{ item.sn }}"
+      register: kc_user_names
+      loop: "{{ cluster_users }}"
+      become: false
+
+    - name: "[KC-GROUPS] Build combined records {username, givenname, sn, groups, password} from cluster_users + compute_name results"
+      set_fact:
+        # kc_user_names.results[i].ansible_facts.username corresponds positionally to cluster_users[i].
+        # We loop over indices to preserve that pairing without any clever Jinja chain.
+        kc_users_with_groups: >-
+          {{ (kc_users_with_groups | default([])) +
+             [{ 'username':  kc_user_names.results[idx].ansible_facts.username,
+                'givenname': cluster_users[idx].givenname,
+                'sn':        cluster_users[idx].sn,
+                'groups':    cluster_users[idx].groups,
+                'password':  cluster_users[idx].password | default('') }] }}
+      loop: "{{ range(cluster_users | length) | list }}"
+      loop_control:
+        loop_var: idx
+      no_log: true
+
+    # When LDAP federation is OFF, Keycloak doesn't have any cluster_users imported from
+    # FreeIPA.  Create them locally using the username derived from compute_name, plus
+    # the password from cluster_users[].password.  Status 201 = created, 409 = already
+    # exists (idempotent re-run).  Subsequent password resets via PUT /reset-password are
+    # skipped here — operators can re-run the role to rotate.
+    - name: "[KC-GROUPS] Ensure each cluster_user exists in Keycloak (Path B — no LDAP federation)"
+      uri:
+        url: "https://{{ keycloak_sso_hostname }}:{{ keycloak_server_port }}/admin/realms/{{ keycloak_realm }}/users"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_post_admin_token.json.access_token }}"
+          Content-Type: application/json
+        body: >-
+          {{ {
+            'username':  item.username,
+            'enabled':   True,
+            'firstName': item.givenname,
+            'lastName':  item.sn,
+            'credentials': [{
+              'type':      'password',
+              'value':     item.password,
+              'temporary': False
+            }] if (item.password | length) > 0 else []
+          } | to_json }}
+        status_code: [201, 409]
+        validate_certs: false
+      loop: "{{ kc_users_with_groups }}"
+      loop_control:
+        label: "{{ item.username }}"
+      become: false
+      no_log: true
+
+    - name: "[KC-GROUPS] Resolve each Keycloak user's UUID by username"
+      uri:
+        url: "https://{{ keycloak_sso_hostname }}:{{ keycloak_server_port }}/admin/realms/{{ keycloak_realm }}/users?username={{ item.username | urlencode }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_post_admin_token.json.access_token }}"
+        validate_certs: false
+        return_content: true
+      register: kc_user_lookups
+      loop: "{{ kc_users_with_groups }}"
+      loop_control:
+        label: "{{ item.username }}"
+      become: false
+
+    - name: "[KC-GROUPS] Build flat (user, group) assignment list with resolved UUIDs"
+      # `subelements` is an Ansible LOOKUP, not a filter — using `| subelements(...)` falls
+      # back to a generic filter dispatcher that rejects our input shape with
+      # "obj must be a list of dicts or a nested dict".  Use a Jinja2 namespace accumulator
+      # instead so we don't depend on community.general filter registration.
+      set_fact:
+        kc_membership_assignments: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for r in kc_user_lookups.results -%}
+            {%- set uid = ((r.json | default([])) | first | default({})).get('id', '') -%}
+            {%- for g in (r.item.groups | default([])) -%}
+              {%- set _ = ns.out.append({
+                    'username':   r.item.username,
+                    'user_id':    uid,
+                    'group_id':   (kc_group_ids | default({})).get(g, ''),
+                    'group_name': g
+                  }) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ ns.out }}
+
+    - name: "[KC-GROUPS] Assign each cluster_user to their declared groups in Keycloak"
+      uri:
+        url: "https://{{ keycloak_sso_hostname }}:{{ keycloak_server_port }}/admin/realms/{{ keycloak_realm }}/users/{{ item.user_id }}/groups/{{ item.group_id }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ kc_post_admin_token.json.access_token }}"
+        validate_certs: false
+        status_code: [204]    # PUT is idempotent in this endpoint — second call also returns 204
+      loop: "{{ kc_membership_assignments | default([]) }}"
+      loop_control:
+        label: "{{ item.username }} → {{ item.group_name }}"
+      become: false
+      when:
+        - item.user_id != ''
+        - item.group_id != ''
+
+- name: "[KC-GROUPS] Path A is handling user/group sync — Path B skipped"
+  ansible.builtin.debug:
+    msg: "LDAP federation is enabled (Path A active via ansible-role-keycloak); skipping post_tasks Path B."
+  when: not (kc_path_b_active | bool)
