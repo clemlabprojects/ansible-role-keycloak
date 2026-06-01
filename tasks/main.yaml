@@ -423,6 +423,44 @@
     validate_certs: "{{ keycloak_validate_certs_resolved }}"
   no_log: true
 
+# Group Membership protocol mapper.  Without this, JWTs from the OIDC client
+# carry NO `groups` claim — which means downstream consumers (Ambari JIT,
+# Polaris OIDC, ...) see an empty groups list regardless of how many groups
+# the user is in on the Keycloak/LDAP side.  Idempotent: looks up existing
+# mappers by name; POSTs only when missing.
+- name: Look up existing protocol mappers on OIDC client
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_id }}/protocol-mappers/models"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_client_existing_mappers
+
+- name: Ensure Group Membership protocol mapper exists on OIDC client
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_client_id }}/protocol-mappers/models"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: "{{ {
+        'name': keycloak_oidc_groups_mapper_name | default('groups'),
+        'protocol': 'openid-connect',
+        'protocolMapper': 'oidc-group-membership-mapper',
+        'consentRequired': False,
+        'config': {
+          'full.path':            (keycloak_oidc_groups_full_path | default('false')),
+          'id.token.claim':       'false',
+          'access.token.claim':   'true',
+          'userinfo.token.claim': 'false',
+          'claim.name':           (keycloak_oidc_groups_claim_name | default('groups'))
+        }
+      } | to_json }}"
+    status_code: [201]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when: >-
+    (keycloak_client_existing_mappers.json | default([])
+      | selectattr('protocolMapper', 'equalto', 'oidc-group-membership-mapper')
+      | list | length) == 0
+
 - name: Retrieve admin client role definitions
   ansible.builtin.uri:
     url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_realm_management_client_id }}/roles/{{ item }}"
@@ -487,10 +525,15 @@
       {{ keycloak_ldap_url
          | default('ldap://' ~ (freeipa_servers | first) if (freeipa_servers is defined and (freeipa_servers | length) > 0) else '') }}
     keycloak_ldap_users_dn_resolved: "{{ keycloak_ldap_users_dn | default(ipaserver_domain_suffix_users | default('')) }}"
+    # Bind as the FreeIPA superuser by default — it's created by ipa-server-install and is
+    # guaranteed to exist when this role runs.  hadoopadmin (a common alternative) is created
+    # later by Ambari's Kerberos bootstrap, which is a chicken-and-egg if we use it here.
+    # Override per-deploy via keycloak_ldap_bind_dn / keycloak_ldap_bind_credential when you
+    # want least-privilege or a service account.
     keycloak_ldap_bind_dn_resolved: >-
       {{ keycloak_ldap_bind_dn
-         | default('uid=hadoopadmin,' ~ ipaserver_domain_suffix_users if (ipaserver_domain_suffix_users is defined) else '') }}
-    keycloak_ldap_bind_credential_resolved: "{{ keycloak_ldap_bind_credential | default(ambari_admin_principal_password | default('')) }}"
+         | default('uid=admin,cn=users,cn=accounts,' ~ ipaserver_domain_suffix if (ipaserver_domain_suffix is defined) else '') }}
+    keycloak_ldap_bind_credential_resolved: "{{ keycloak_ldap_bind_credential | default(ipaadmin_password | default(ambari_admin_principal_password | default(''))) }}"
     keycloak_ldap_username_attr: "{{ keycloak_ldap_username_attr | default('uid') }}"
     keycloak_ldap_rdn_attr: "{{ keycloak_ldap_rdn_attr | default('uid') }}"
     keycloak_ldap_uuid_attr: "{{ keycloak_ldap_uuid_attr | default('ipaUniqueID') }}"
