@@ -306,7 +306,15 @@
     url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users"
     method: POST
     headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
-    body: "{{ {'username': keycloak_service_user, 'enabled': True, 'emailVerified': True} | to_json }}"
+    body: >-
+      {{ {
+        'username':      keycloak_service_user,
+        'enabled':       True,
+        'emailVerified': True,
+        'email':         keycloak_service_user_email     | default(keycloak_service_user ~ '@' ~ keycloak_sso_hostname),
+        'firstName':     keycloak_service_user_firstname | default(keycloak_service_user),
+        'lastName':      keycloak_service_user_lastname  | default('Service')
+      } | to_json }}
     status_code: [201, 409]
     validate_certs: "{{ keycloak_validate_certs_resolved }}"
   register: keycloak_service_user_create
@@ -325,6 +333,26 @@
 
 - set_fact:
     keycloak_service_user_id: "{{ (keycloak_service_user_lookup.json | first).id }}"
+
+# Keycloak 25 user-profile validation blocks ROPC login when email/firstName/lastName are absent.
+# PUT ensures existing users (409 on create) also get these fields.
+- name: Ensure service user profile is complete
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/users/{{ keycloak_service_user_id }}"
+    method: PUT
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: >-
+      {{ {
+        'username':      keycloak_service_user,
+        'enabled':       True,
+        'emailVerified': True,
+        'email':         keycloak_service_user_email     | default(keycloak_service_user ~ '@' ~ keycloak_sso_hostname),
+        'firstName':     keycloak_service_user_firstname | default(keycloak_service_user),
+        'lastName':      keycloak_service_user_lastname  | default('Service')
+      } | to_json }}
+    status_code: 204
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  no_log: true
 
 - name: Configure service user credentials
   ansible.builtin.uri:
