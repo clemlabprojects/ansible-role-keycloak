@@ -1,0 +1,128 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Active Directory LDAP User Federation in Keycloak
+#
+# Federates Active Directory users into the ODP Keycloak realm in READ_ONLY
+# mode.  Uses sAMAccountName as the Keycloak username (consistent with how AD
+# accounts are referenced in HDP/ODP cluster policies).
+#
+# Guard: ad_servers is defined
+#
+# Required variables when enabled:
+#   ad_servers          — list of AD domain controller hostnames/IPs
+#   ad_bind_dn          — bind DN for the read-only service account
+#                         (e.g. CN=svc-keycloak,OU=ServiceAccounts,DC=corp,DC=example,DC=com)
+#   ad_bind_password    — password for the bind account  (vault)
+#   ad_users_dn         — base DN for user searches
+#                         (e.g. DC=corp,DC=example,DC=com)
+#
+# Optional variables:
+#   ad_use_ldaps        — use LDAPS on port 636 instead of LDAP 389 (default: false)
+#   keycloak_ad_sync_on_create — trigger a full sync after creation (default: true)
+# ---------------------------------------------------------------------------
+
+- name: "[AD LDAP] Check whether AD federation already exists"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.UserStorageProvider"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ad_components
+  when: ad_servers is defined
+
+- name: "[AD LDAP] Derive AD federation state"
+  ansible.builtin.set_fact:
+    keycloak_ad_federation_exists: >-
+      {{ (keycloak_ad_components.json | default([])
+          | selectattr('name', 'equalto', 'ActiveDirectory') | list | length) > 0 }}
+    keycloak_ad_federation_id: >-
+      {{ (keycloak_ad_components.json | default([])
+          | selectattr('name', 'equalto', 'ActiveDirectory') | list | first | default({})).id | default('') }}
+  when: ad_servers is defined
+
+- name: "[AD LDAP] Create Active Directory LDAP federation in Keycloak realm"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: >-
+      {{
+        {
+          'name': 'ActiveDirectory',
+          'providerId': 'ldap',
+          'providerType': 'org.keycloak.storage.UserStorageProvider',
+          'parentId': keycloak_realm,
+          'config': {
+            'vendor': ['ad'],
+            'connectionUrl': [('ldaps' if ad_use_ldaps | default(false) else 'ldap') + '://' + (ad_servers | first)],
+            'bindDn': [ad_bind_dn],
+            'bindCredential': [ad_bind_password],
+            'usersDn': [ad_users_dn],
+            'usernameLDAPAttribute': ['sAMAccountName'],
+            'rdnLDAPAttribute': ['cn'],
+            'uuidLDAPAttribute': ['objectGUID'],
+            'userObjectClasses': ['person, organizationalPerson, user'],
+            'editMode': ['READ_ONLY'],
+            'syncRegistrations': ['false'],
+            'importEnabled': ['true'],
+            'searchScope': ['2'],
+            'enabled': ['true'],
+            'priority': ['10'],
+            'fullSyncPeriod': ['-1'],
+            'changedSyncPeriod': ['-1'],
+            'pagination': ['true'],
+            'useTruststoreSpi': ['ldapsOnly'],
+            'useKerberosForPasswordAuthentication': ['false']
+          }
+        } | to_json
+      }}
+    status_code: [201, 409]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ad_create
+  changed_when: keycloak_ad_create.status == 201
+  when:
+    - ad_servers is defined
+    - not keycloak_ad_federation_exists
+  no_log: true
+
+- name: "[AD LDAP] Refresh AD federation ID after creation"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/components?type=org.keycloak.storage.UserStorageProvider"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ad_components_post
+  when:
+    - ad_servers is defined
+    - not keycloak_ad_federation_exists
+
+- name: "[AD LDAP] Set AD federation ID from creation response"
+  ansible.builtin.set_fact:
+    keycloak_ad_federation_id: >-
+      {{ (keycloak_ad_components_post.json | default([])
+          | selectattr('name', 'equalto', 'ActiveDirectory') | list | first | default({})).id | default('') }}
+  when:
+    - ad_servers is defined
+    - not keycloak_ad_federation_exists
+
+- name: "[AD LDAP] Trigger full user sync from Active Directory"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/user-storage/{{ keycloak_ad_federation_id }}/sync?action=triggerFullSync"
+    method: POST
+    headers: "{{ keycloak_admin_headers }}"
+    status_code: [200, 204]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when:
+    - ad_servers is defined
+    - keycloak_ad_sync_on_create | default(true)
+    - keycloak_ad_federation_id | default('') | length > 0
+  register: keycloak_ad_sync
+  ignore_errors: true

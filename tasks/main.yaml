@@ -986,3 +986,14 @@
   ansible.builtin.debug:
     msg: "LDAP federation is enabled (Path A active via ansible-role-keycloak); skipping post_tasks Path B."
   when: not (kc_path_b_active | bool)
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Ambari JWT SSO (guarded by ambari_sso_enabled | default(false))
+# Phase 4 — Active Directory LDAP federation (guarded by ad_servers is defined)
+# ---------------------------------------------------------------------------
+
+- name: Include Ambari SSO configuration tasks
+  ansible.builtin.include_tasks: ambari_sso.yaml
+
+- name: Include Active Directory LDAP federation tasks
+  ansible.builtin.include_tasks: ad_ldap.yaml

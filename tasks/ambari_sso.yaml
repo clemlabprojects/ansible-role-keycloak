@@ -1,0 +1,198 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Ambari JWT SSO via Keycloak (server-side OIDC callback flow)
+#
+# What this does:
+#   1. Registers a *confidential* OIDC client for Ambari in Keycloak.
+#      The client uses the authorization-code flow with a client secret so
+#      that OidcCallbackFilter can exchange the code server-side (never
+#      exposing the token to JavaScript) and issue an HttpOnly cookie.
+#   2. Retrieves the auto-generated client secret from Keycloak.
+#   3. Fetches the realm RSA public key that Ambari uses to validate JWTs.
+#   4. Configures Ambari JWT SSO via the Ambari REST API, writing the three
+#      new ambari.sso.oidc.* properties required by OidcCallbackFilter.
+#
+# Guard: ambari_sso_enabled | default(false)
+#
+# Required variables when enabled:
+#   ambari_server_host            — hostname / LB FQDN of the Ambari server
+#   ambari_server_port            — Ambari HTTPS port (default 8442)
+#   ambari_admin_user             — Ambari admin username
+#   ambari_admin_password         — Ambari admin password  (vault)
+#   keycloak_base_url             — Keycloak base URL
+#   keycloak_realm                — Realm name
+#   keycloak_admin_headers        — dict with Authorization: Bearer <admin token>
+#   keycloak_validate_certs_resolved — bool
+#
+# Optional variables:
+#   ambari_sso_cookie_name        — cookie name (default: hadoop-jwt)
+#   keycloak_ambari_client_id     — OIDC client ID to register (default: ambari)
+#   keycloak_ambari_redirect_uris — list of allowed redirect URIs
+#   ambari_sso_oidc_callback_url  — override the redirect_uri for LB deployments
+# ---------------------------------------------------------------------------
+
+- name: "[Ambari SSO] Assert required variables are defined"
+  ansible.builtin.assert:
+    that:
+      - ambari_server_host is defined
+      - ambari_admin_user is defined
+      - ambari_admin_password is defined
+    quiet: true
+  when: ambari_sso_enabled | default(false)
+
+- name: "[Ambari SSO] Derive default values"
+  ansible.builtin.set_fact:
+    _ambari_port: "{{ ambari_server_port | default(8442) }}"
+    _ambari_sso_cookie: "{{ ambari_sso_cookie_name | default('hadoop-jwt') }}"
+    _ambari_client_id: "{{ keycloak_ambari_client_id | default('ambari') }}"
+    _ambari_base: "https://{{ ambari_server_host }}:{{ ambari_server_port | default(8442) }}"
+  when: ambari_sso_enabled | default(false)
+
+- name: "[Ambari SSO] Derive redirect URIs and callback URL"
+  ansible.builtin.set_fact:
+    _ambari_redirect_uris: >-
+      {{
+        keycloak_ambari_redirect_uris
+        | default([
+            'https://' + ambari_server_host + ':' + (ambari_server_port | default(8442) | string) + '/*'
+          ])
+      }}
+    _ambari_callback_url: >-
+      {{
+        ambari_sso_oidc_callback_url
+        | default('https://' + ambari_server_host + ':' + (ambari_server_port | default(8442) | string) + '/oidc/callback')
+      }}
+  when: ambari_sso_enabled | default(false)
+
+# ── 1. Register Ambari OIDC client in Keycloak (confidential) ───────────────
+
+- name: "[Ambari SSO] Register confidential Ambari OIDC client in Keycloak"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients"
+    method: POST
+    headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
+    body: >-
+      {{
+        {
+          'clientId': _ambari_client_id,
+          'protocol': 'openid-connect',
+          'enabled': True,
+          'publicClient': False,
+          'clientAuthenticatorType': 'client-secret',
+          'standardFlowEnabled': True,
+          'serviceAccountsEnabled': False,
+          'directAccessGrantsEnabled': False,
+          'redirectUris': _ambari_redirect_uris,
+          'webOrigins': [_ambari_base],
+          'attributes': {}
+        } | to_json
+      }}
+    status_code: [201, 409]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ambari_client_create
+  changed_when: keycloak_ambari_client_create.status == 201
+  when: ambari_sso_enabled | default(false)
+
+# ── 2. Look up the client UUID ───────────────────────────────────────────────
+
+- name: "[Ambari SSO] Look up Ambari OIDC client UUID"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId={{ _ambari_client_id | urlencode }}"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ambari_client_lookup
+  failed_when: (keycloak_ambari_client_lookup.json | length) == 0
+  when: ambari_sso_enabled | default(false)
+
+- name: "[Ambari SSO] Set Ambari client UUID fact"
+  ansible.builtin.set_fact:
+    keycloak_ambari_client_uuid: "{{ (keycloak_ambari_client_lookup.json | first).id }}"
+  when: ambari_sso_enabled | default(false)
+
+# ── 3. Retrieve the client secret ───────────────────────────────────────────
+
+- name: "[Ambari SSO] Retrieve Ambari OIDC client secret from Keycloak"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ keycloak_ambari_client_uuid }}/client-secret"
+    method: GET
+    headers: "{{ keycloak_admin_headers }}"
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_ambari_secret_response
+  no_log: true
+  when: ambari_sso_enabled | default(false)
+
+- name: "[Ambari SSO] Set client secret fact"
+  ansible.builtin.set_fact:
+    _ambari_oidc_client_secret: "{{ keycloak_ambari_secret_response.json.value }}"
+  no_log: true
+  when: ambari_sso_enabled | default(false)
+
+# ── 4. Fetch realm RSA public key ────────────────────────────────────────────
+
+- name: "[Ambari SSO] Fetch Keycloak realm info (RSA public key)"
+  ansible.builtin.uri:
+    url: "{{ keycloak_base_url }}/realms/{{ keycloak_realm }}"
+    method: GET
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  register: keycloak_realm_info
+  when: ambari_sso_enabled | default(false)
+
+- name: "[Ambari SSO] Set realm RSA public key fact"
+  ansible.builtin.set_fact:
+    keycloak_realm_public_key: "{{ keycloak_realm_info.json.public_key }}"
+  when: ambari_sso_enabled | default(false)
+
+# ── 5. Configure Ambari JWT SSO + OIDC callback via REST API ─────────────────
+
+- name: "[Ambari SSO] Configure Ambari JWT SSO + OIDC callback via REST API"
+  ansible.builtin.uri:
+    url: "{{ _ambari_base }}/api/v1/services/AMBARI/components/AMBARI_SERVER/configurations"
+    method: PUT
+    url_username: "{{ ambari_admin_user }}"
+    url_password: "{{ ambari_admin_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "application/json"
+      X-Requested-By: "ambari"
+    body: >-
+      {{
+        {
+          'Configuration': {
+            'category': 'sso-configuration',
+            'properties': {
+              'ambari.sso.authentication.enabled': 'true',
+              'ambari.sso.enabled.services': 'AMBARI',
+              'ambari.sso.provider.url': keycloak_base_url + '/realms/' + keycloak_realm + '/protocol/openid-connect/auth',
+              'ambari.sso.provider.certificate': keycloak_realm_public_key,
+              'ambari.sso.jwt.cookieName': _ambari_sso_cookie,
+              'ambari.sso.jwt.audiences': '',
+              'ambari.sso.oidc.clientId': _ambari_client_id,
+              'ambari.sso.oidc.clientSecret': _ambari_oidc_client_secret,
+              'ambari.sso.oidc.callbackUrl': _ambari_callback_url
+            }
+          }
+        } | to_json
+      }}
+    status_code: [200, 201, 204]
+    validate_certs: "{{ keycloak_validate_certs_resolved }}"
+  when: ambari_sso_enabled | default(false)
+  no_log: true
+
+- name: "[Ambari SSO] Summary"
+  ansible.builtin.debug:
+    msg: >
+      Ambari JWT SSO configured with server-side OIDC callback flow.
+      Keycloak confidential OIDC client '{{ _ambari_client_id }}' registered in realm '{{ keycloak_realm }}'.
+      Callback URL: {{ _ambari_callback_url }}
+      Ambari at {{ _ambari_base }} will redirect unauthenticated browsers to Keycloak,
+      exchange the authorization code server-side, and issue an HttpOnly JWT cookie.
+  when: ambari_sso_enabled | default(false)
