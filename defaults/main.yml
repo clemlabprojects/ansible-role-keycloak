@@ -1,0 +1,3 @@
+---
+# default raised from Keycloak's 36000 (10h) so per-client access.token.lifespan overrides up to 24h are not silently clamped
+keycloak_realm_sso_session_max_lifespan: 86400

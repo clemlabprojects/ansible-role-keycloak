@@ -290,12 +290,21 @@
       Authorization: "Bearer {{ keycloak_admin_token }}"
   no_log: true
 
+# Default SSO session max lifespan to 24h (86400s). Keycloak's own server
+# default is 10h (36000s), which silently clamps per-client
+# accessTokenLifespan (see dev01-realm / trino-trino-ns incident: 24h
+# client token quietly capped at 10h until the realm value was bumped).
 - name: Ensure production realm exists
   ansible.builtin.uri:
     url: "{{ keycloak_base_url }}/admin/realms"
     method: POST
     headers: "{{ keycloak_admin_headers | combine({'Content-Type': 'application/json'}) }}"
-    body: "{{ {'id': keycloak_realm, 'realm': keycloak_realm, 'enabled': True} | to_json }}"
+    body: "{{ {
+        'id': keycloak_realm,
+        'realm': keycloak_realm,
+        'enabled': True,
+        'ssoSessionMaxLifespan': keycloak_realm_sso_session_max_lifespan
+      } | to_json }}"
     status_code: [201, 409]
     validate_certs: "{{ keycloak_validate_certs_resolved }}"
   register: keycloak_realm_create
